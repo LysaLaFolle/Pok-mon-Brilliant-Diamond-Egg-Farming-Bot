@@ -1,0 +1,942 @@
+import os
+import time
+import re
+import unicodedata
+from datetime import datetime
+from typing import Optional
+
+import cv2
+import mss
+import numpy as np
+import psutil
+import win32gui
+import win32process
+from rapidocr_onnxruntime import RapidOCR
+
+from utils.controller import Controller
+
+# ==========================================
+# BOT OEUF + ENVOI PC
+# OCR + calibration visuelle PNJ / joueur
+# ==========================================
+
+# -----------------------------
+# DEMARRAGE
+# -----------------------------
+CONTROLLER_SETUP_DELAY = 5.0
+START_DELAY = 2.0
+
+# -----------------------------
+# MOUVEMENT
+# -----------------------------
+AMPLITUDE = 220
+MOVE_HOLD = 0.09
+MOVE_WAIT = 0.06
+
+INITIAL_RIGHT_TAPS = 2
+HORIZONTAL_REPEATS = 140
+
+RECENTER_MAX_ATTEMPTS = 4
+
+STEP_TO_INTERACT_DELAY = 0.25
+FACE_TO_INTERACT_DELAY = 0.20
+POST_INTERACT_DELAY = 0.60
+
+# -----------------------------
+# BOUTONS
+# -----------------------------
+# Inversion A/B pour Ryujinx
+BTN_A = "B"
+BTN_B = "A"
+
+INTERACT_BUTTON = BTN_A
+ADVANCE_BUTTON = BTN_A
+SEND_TO_PC_BUTTON = BTN_B
+NO_EGG_CLOSE_BUTTON = BTN_B
+
+# -----------------------------
+# DIALOGUES
+# -----------------------------
+EGG_ADVANCE_PRESSES = 10
+EGG_SEND_TO_PC_PRESSES = 10
+POST_DIALOG_WAIT = 0.40
+
+# -----------------------------
+# OCR
+# -----------------------------
+OCR = RapidOCR()
+
+OCR_LEFT_RATIO = 0.14
+OCR_TOP_RATIO = 0.80
+OCR_WIDTH_RATIO = 0.72
+OCR_HEIGHT_RATIO = 0.17
+
+OCR_READ_RETRIES = 1
+OCR_READ_RETRY_DELAY = 0.10
+
+# -----------------------------
+# VISION / CALIBRATION INITIALE
+# -----------------------------
+TEMPLATE_DIR = "templates"
+NPC_TEMPLATE_PATH = os.path.join(TEMPLATE_DIR, "npc.png")
+
+PLAYER_TEMPLATE_PATHS = [
+    os.path.join(TEMPLATE_DIR, "player_1.png"),
+    os.path.join(TEMPLATE_DIR, "player_2.png"),
+    os.path.join(TEMPLATE_DIR, "player_3.png"),
+    os.path.join(TEMPLATE_DIR, "player_4.png"),
+    os.path.join(TEMPLATE_DIR, "player_5.png"),
+    os.path.join(TEMPLATE_DIR, "player_6.png"),
+    os.path.join(TEMPLATE_DIR, "player_7.png"),
+    os.path.join(TEMPLATE_DIR, "player_8.png"),
+]
+
+SCENE_LEFT_RATIO = 0.08
+SCENE_TOP_RATIO = 0.08
+SCENE_WIDTH_RATIO = 0.82
+SCENE_HEIGHT_RATIO = 0.78
+
+NPC_TEMPLATE_THRESHOLD = 0.42
+RECALIB_NPC_THRESHOLD = 0.40
+PLAYER_TEMPLATE_THRESHOLD = 0.54
+
+# ROI calibration joueur autour du PNJ
+CALIB_PLAYER_MIN_DX = 70
+CALIB_PLAYER_MAX_DX = 160
+CALIB_PLAYER_MIN_DY = -110
+CALIB_PLAYER_MAX_DY = -20
+
+CALIB_PLAYER_ROI_MARGIN_X = 35
+CALIB_PLAYER_ROI_MARGIN_Y = 35
+
+# recalibrage immédiat après 1 cycle raté
+VISION_RECALIB_FAIL_THRESHOLD = 1
+
+# -----------------------------
+# DEBUG
+# -----------------------------
+DEBUG_OCR = True
+DEBUG_SAVE_IMAGES = False
+DEBUG_DIR = "debug_ocr"
+
+DEBUG_VISION = True
+DEBUG_VISION_DIR = "debug_vision"
+
+REFERENCE_CALIBRATION = None
+
+print("DEBUG THRESHOLDS:", NPC_TEMPLATE_THRESHOLD, PLAYER_TEMPLATE_THRESHOLD)
+print("DEBUG SCENE:", SCENE_LEFT_RATIO, SCENE_TOP_RATIO, SCENE_WIDTH_RATIO, SCENE_HEIGHT_RATIO)
+
+
+# =========================================================
+# OUTILS GENERAUX
+# =========================================================
+def normalize_text(s: str) -> str:
+    s = s.lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.replace("’", " ")
+    s = s.replace("'", " ")
+    s = s.replace("`", " ")
+    s = re.sub(r"[^a-z0-9!\?\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def timestamp_str() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def stick_macro(x: int, y: int, hold: float, wait: float = 0.0) -> str:
+    return f"L_STICK@{x:+04d}{y:+04d} {hold:.3f}s {wait:.3f}s"
+
+
+def move_right(controller: Controller, count: int = 1):
+    for _ in range(count):
+        controller.macro(stick_macro(AMPLITUDE, 0, MOVE_HOLD, MOVE_WAIT))
+
+
+def move_left(controller: Controller, count: int = 1):
+    for _ in range(count):
+        controller.macro(stick_macro(-AMPLITUDE, 0, MOVE_HOLD, MOVE_WAIT))
+
+
+def move_up(controller: Controller, count: int = 1):
+    for _ in range(count):
+        controller.macro(stick_macro(0, +AMPLITUDE, MOVE_HOLD, MOVE_WAIT))
+
+
+def move_down(controller: Controller, count: int = 1):
+    for _ in range(count):
+        controller.macro(stick_macro(0, -AMPLITUDE, MOVE_HOLD, MOVE_WAIT))
+
+
+def face_left(controller: Controller):
+    controller.macro(stick_macro(-AMPLITUDE, 0, 0.08, 0.10))
+
+
+def dpad_left(controller: Controller, hold: float = 0.10, wait: float = 0.10):
+    controller.macro(f"DPAD_LEFT {hold:.2f}s {wait:.2f}s")
+
+
+def press_button(controller: Controller, button: str, hold: float = 0.18, wait: float = 0.30):
+    controller.macro(f"{button} {hold:.2f}s {wait:.2f}s")
+
+
+def press_many(controller: Controller, button: str, count: int, hold: float = 0.18, wait: float = 0.30):
+    for _ in range(count):
+        press_button(controller, button, hold=hold, wait=wait)
+
+
+def do_egg_steps(controller: Controller):
+    for _ in range(HORIZONTAL_REPEATS):
+        move_right(controller, 1)
+        move_left(controller, 1)
+
+
+# =========================================================
+# CAPTURE RYUJINX
+# =========================================================
+def find_ryujinx_hwnd() -> Optional[int]:
+    hwnds = []
+
+    def callback(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+
+        title = win32gui.GetWindowText(hwnd)
+        if not title:
+            return True
+
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            proc_name = psutil.Process(pid).name().lower()
+        except Exception:
+            return True
+
+        if "ryujinx" in title.lower() or "ryujinx" in proc_name:
+            hwnds.append(hwnd)
+
+        return True
+
+    win32gui.EnumWindows(callback, None)
+    return hwnds[0] if hwnds else None
+
+
+def get_ryujinx_client_rect_on_screen(hwnd: int):
+    left, top, right, bottom = win32gui.GetClientRect(hwnd)
+    x1, y1 = win32gui.ClientToScreen(hwnd, (left, top))
+    x2, y2 = win32gui.ClientToScreen(hwnd, (right, bottom))
+    return x1, y1, x2, y2
+
+
+def grab_ryujinx_client_bgr() -> np.ndarray:
+    hwnd = find_ryujinx_hwnd()
+    if hwnd is None:
+        raise RuntimeError("Fenêtre Ryujinx introuvable.")
+
+    x1, y1, x2, y2 = get_ryujinx_client_rect_on_screen(hwnd)
+    width = x2 - x1
+    height = y2 - y1
+
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Zone client Ryujinx invalide.")
+
+    with mss.mss() as sct:
+        shot = np.array(sct.grab({
+            "left": x1,
+            "top": y1,
+            "width": width,
+            "height": height,
+        }))
+
+    return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+
+
+# =========================================================
+# OCR
+# =========================================================
+def crop_ocr_region(client_bgr: np.ndarray) -> np.ndarray:
+    h, w = client_bgr.shape[:2]
+
+    left = int(w * OCR_LEFT_RATIO)
+    top = int(h * OCR_TOP_RATIO)
+    width = int(w * OCR_WIDTH_RATIO)
+    height = int(h * OCR_HEIGHT_RATIO)
+
+    right = min(w, left + width)
+    bottom = min(h, top + height)
+
+    return client_bgr[top:bottom, left:right]
+
+
+def preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.bilateralFilter(gray, 7, 40, 40)
+
+    th = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11
+    )
+    return th
+
+
+def dialog_box_likely_present(client_bgr: np.ndarray) -> bool:
+    roi = crop_ocr_region(client_bgr)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    mean_val = float(np.mean(gray))
+    bright_ratio = float(np.mean(gray > 170))
+
+    return mean_val > 80 and bright_ratio > 0.18
+
+
+def extract_text_from_rapidocr_result(result) -> str:
+    parts = []
+
+    if not result:
+        return ""
+
+    for item in result:
+        try:
+            if len(item) >= 3 and isinstance(item[1], str):
+                parts.append(item[1])
+                continue
+
+            if len(item) >= 2 and isinstance(item[1], (list, tuple)) and len(item[1]) >= 1:
+                parts.append(str(item[1][0]))
+                continue
+
+            if len(item) >= 2:
+                parts.append(str(item[1]))
+        except Exception:
+            continue
+
+    return normalize_text(" ".join(parts))
+
+
+def save_debug_ocr_images(client: np.ndarray, roi: np.ndarray, proc: np.ndarray, text: str):
+    if not DEBUG_SAVE_IMAGES:
+        return
+
+    ensure_dir(DEBUG_DIR)
+    ts = timestamp_str()
+
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{ts}_client.png"), client)
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{ts}_roi.png"), roi)
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{ts}_proc.png"), proc)
+
+    with open(os.path.join(DEBUG_DIR, f"{ts}_ocr.txt"), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def read_dialog_text_once() -> str:
+    client = grab_ryujinx_client_bgr()
+    roi = crop_ocr_region(client)
+    proc = preprocess_for_ocr(roi)
+
+    result, _ = OCR(proc)
+    text = extract_text_from_rapidocr_result(result)
+
+    if DEBUG_OCR:
+        print(f"[OCR] {text}")
+
+    save_debug_ocr_images(client, roi, proc, text)
+    return text
+
+
+def read_dialog_text() -> str:
+    best_text = ""
+
+    for attempt in range(OCR_READ_RETRIES):
+        text = read_dialog_text_once()
+
+        if len(text) > len(best_text):
+            best_text = text
+
+        if len(text) >= 10:
+            return text
+
+        if attempt < OCR_READ_RETRIES - 1:
+            time.sleep(OCR_READ_RETRY_DELAY)
+
+    return best_text
+
+
+def read_dialog_text_from_client(client: np.ndarray) -> str:
+    roi = crop_ocr_region(client)
+    proc = preprocess_for_ocr(roi)
+
+    result, _ = OCR(proc)
+    text = extract_text_from_rapidocr_result(result)
+
+    if DEBUG_OCR:
+        print(f"[OCR] {text}")
+
+    return text
+
+
+def is_dialog_open(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.strip()
+
+    if len(t) < 10:
+        return False
+
+    letters = sum(1 for c in t if c.isalpha())
+    digits = sum(1 for c in t if c.isdigit())
+
+    if letters < 6:
+        return False
+
+    if digits > letters:
+        return False
+
+    words = [w for w in t.split() if len(w) >= 2]
+    if len(words) < 3:
+        return False
+
+    junk_chars = set("il1|/\\v")
+    junk_count = sum(1 for c in t.lower() if c in junk_chars)
+    significant_chars = sum(1 for c in t if not c.isspace())
+
+    if significant_chars > 0 and (junk_count / significant_chars) > 0.55:
+        return False
+
+    return True
+
+
+def looks_like_real_dialog(text: str) -> bool:
+    if not text:
+        return False
+
+    common_dialog_words = [
+        "toi",
+        "pokemon",
+        "oeuf",
+        "surprises",
+        "content",
+        "voir",
+        "viens",
+        "reviens",
+        "encore",
+        "pension",
+        "beau",
+        "matin",
+        "tenait",
+        "avait",
+        "tes",
+        "des",
+        "une",
+        "pas",
+    ]
+
+    hits = sum(1 for word in common_dialog_words if word in text)
+    return hits >= 1
+
+
+def detect_dialog_state_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    egg_markers_strong = [
+        "tenait un oeuf",
+        "voici un oeuf",
+        "un oeuf a ete trouve",
+        "avait un oeuf",
+        "oeuf pokemon",
+        "tes pokemon",
+        "fait de ces surprises",
+    ]
+
+    egg_markers_soft = [
+        "un oeuf",
+        "oeuf",
+        "surprises",
+        "beau matin",
+        "pension",
+        "tes pokemon",
+        "une",
+    ]
+
+    no_egg_markers = [
+        "content de te voir",
+        "reviens me voir",
+        "viens me voir",
+        "pas encore",
+        "aucun oeuf",
+        "pas d oeuf",
+        "reviens plus tard",
+    ]
+
+    if any(marker in text for marker in egg_markers_strong):
+        return "egg"
+
+    egg_soft_hits = sum(1 for marker in egg_markers_soft if marker in text)
+    if egg_soft_hits >= 2:
+        return "egg"
+
+    no_egg_hits = sum(1 for marker in no_egg_markers if marker in text)
+    if no_egg_hits >= 1 and egg_soft_hits == 0:
+        return "no_egg"
+
+    return None
+
+
+def handle_no_egg_dialog(controller: Controller):
+    print("Pas encore d'oeuf.")
+    press_many(controller, NO_EGG_CLOSE_BUTTON, 3, hold=0.18, wait=0.22)
+    time.sleep(0.20)
+    press_button(controller, NO_EGG_CLOSE_BUTTON, hold=0.18, wait=0.35)
+    time.sleep(POST_DIALOG_WAIT)
+
+
+def handle_egg_dialog(controller: Controller):
+    print("Oeuf détecté. Envoi au PC...")
+    press_many(controller, ADVANCE_BUTTON, EGG_ADVANCE_PRESSES, hold=0.18, wait=0.25)
+    time.sleep(0.30)
+    press_many(controller, SEND_TO_PC_BUTTON, EGG_SEND_TO_PC_PRESSES, hold=0.18, wait=0.25)
+    time.sleep(0.50)
+
+
+def try_interact_and_read_dialog(controller: Controller):
+    face_left(controller)
+    time.sleep(FACE_TO_INTERACT_DELAY)
+
+    press_button(controller, INTERACT_BUTTON, hold=0.18, wait=0.35)
+    time.sleep(POST_INTERACT_DELAY)
+
+    client = grab_ryujinx_client_bgr()
+
+    if not dialog_box_likely_present(client):
+        return False, None, ""
+
+    text = read_dialog_text_from_client(client)
+
+    if not is_dialog_open(text):
+        return False, None, text
+
+    if looks_like_real_dialog(text):
+        state = detect_dialog_state_from_text(text)
+        return True, state, text
+
+    return False, None, text
+
+
+def interact_with_npc_and_resolve(controller: Controller):
+    print("Recherche du PNJ : un petit pas, une tentative...")
+
+    for attempt in range(RECENTER_MAX_ATTEMPTS):
+        move_left(controller, 1)
+        time.sleep(STEP_TO_INTERACT_DELAY)
+
+        dialog_open, state, text = try_interact_and_read_dialog(controller)
+
+        if dialog_open:
+            if DEBUG_OCR:
+                print(f"[INFO] Vrai dialogue détecté | OCR='{text}' | state={state}")
+
+            if state == "egg":
+                handle_egg_dialog(controller)
+                return "egg"
+
+            if state == "no_egg":
+                handle_no_egg_dialog(controller)
+                return "no_egg"
+
+            if DEBUG_OCR:
+                print("[INFO] Dialogue valide détecté mais aucun mot-clé reconnu.")
+            return "dialog_unrecognized"
+
+        if DEBUG_OCR:
+            print(f"[INFO] Petit pas {attempt + 1}/{RECENTER_MAX_ATTEMPTS} : pas de vrai dialogue | OCR='{text}'")
+
+    print("PNJ non trouvé après tous les petits pas.")
+    return None
+
+
+# =========================================================
+# VISION (utilisée seulement pour la calibration initiale)
+# =========================================================
+def crop_scene_region(client_bgr: np.ndarray) -> np.ndarray:
+    h, w = client_bgr.shape[:2]
+
+    left = int(w * SCENE_LEFT_RATIO)
+    top = int(h * SCENE_TOP_RATIO)
+    width = int(w * SCENE_WIDTH_RATIO)
+    height = int(h * SCENE_HEIGHT_RATIO)
+
+    right = min(w, left + width)
+    bottom = min(h, top + height)
+
+    return client_bgr[top:bottom, left:right]
+
+
+def locate_template(haystack_bgr: np.ndarray, template_path: str, threshold: float = 0.80):
+    template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+    if template is None:
+        raise RuntimeError(f"Template introuvable: {template_path}")
+
+    haystack_gray = cv2.cvtColor(haystack_bgr, cv2.COLOR_BGR2GRAY)
+    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+
+    result = cv2.matchTemplate(haystack_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+    print(f"[VISION] {os.path.basename(template_path)} score={max_val:.3f} threshold={threshold:.3f}")
+
+    if max_val < threshold:
+        return None
+
+    th, tw = template_gray.shape[:2]
+    center_x = max_loc[0] + tw // 2
+    center_y = max_loc[1] + th // 2
+
+    return {
+        "score": max_val,
+        "x": center_x,
+        "y": center_y,
+        "top_left": max_loc,
+        "w": tw,
+        "h": th,
+        "template_path": template_path,
+    }
+
+
+def locate_best_player_template(haystack_bgr: np.ndarray, template_paths, threshold: float):
+    best_match = None
+    best_score = -1.0
+
+    if haystack_bgr is None or haystack_bgr.size == 0:
+        print("[VISION] haystack joueur vide.")
+        return None
+
+    haystack_gray = cv2.cvtColor(haystack_bgr, cv2.COLOR_BGR2GRAY)
+    hh, hw = haystack_gray.shape[:2]
+
+    for template_path in template_paths:
+        template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+        if template is None:
+            print(f"[VISION] template joueur introuvable: {template_path}")
+            continue
+
+        template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        th, tw = template_gray.shape[:2]
+
+        if th > hh or tw > hw:
+            print(
+                f"[VISION] {os.path.basename(template_path)} ignoré "
+                f"(template trop grand pour ROI: template={tw}x{th}, roi={hw}x{hh})"
+            )
+            continue
+
+        result = cv2.matchTemplate(haystack_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+        print(f"[VISION] {os.path.basename(template_path)} score={max_val:.3f} threshold={threshold:.3f}")
+
+        if max_val > best_score:
+            best_score = max_val
+            best_match = {
+                "score": max_val,
+                "x": max_loc[0] + tw // 2,
+                "y": max_loc[1] + th // 2,
+                "top_left": max_loc,
+                "w": tw,
+                "h": th,
+                "template_path": template_path,
+            }
+
+    if best_match is not None:
+        print(
+            f"[VISION] Best joueur match: "
+            f"{os.path.basename(best_match['template_path'])} "
+            f"score={best_match['score']:.3f} "
+            f"pos=({best_match['x']},{best_match['y']})"
+        )
+
+    if best_match is None:
+        return None
+
+    if best_match["score"] < threshold:
+        return None
+
+    return best_match
+
+
+def locate_best_player_template_in_roi(
+    haystack_bgr: np.ndarray,
+    template_paths,
+    roi_left: int,
+    roi_top: int,
+    roi_right: int,
+    roi_bottom: int,
+    threshold: float
+):
+    h, w = haystack_bgr.shape[:2]
+
+    roi_left = max(0, roi_left)
+    roi_top = max(0, roi_top)
+    roi_right = min(w, roi_right)
+    roi_bottom = min(h, roi_bottom)
+
+    if roi_right <= roi_left or roi_bottom <= roi_top:
+        print("[VISION] ROI joueur invalide.")
+        return None
+
+    roi = haystack_bgr[roi_top:roi_bottom, roi_left:roi_right]
+
+    if roi is None or roi.size == 0:
+        print("[VISION] ROI joueur vide.")
+        return None
+
+    rh, rw = roi.shape[:2]
+    print(f"[VISION] ROI joueur taille: {rw}x{rh}")
+
+    best_match = locate_best_player_template(roi, template_paths, threshold)
+
+    if best_match is None:
+        return None
+
+    best_match["x"] += roi_left
+    best_match["y"] += roi_top
+
+    x1, y1 = best_match["top_left"]
+    best_match["top_left"] = (x1 + roi_left, y1 + roi_top)
+
+    return best_match
+
+
+def save_debug_scene(scene_bgr: np.ndarray, npc, player, prefix: str = "scene"):
+    if not DEBUG_VISION:
+        return
+
+    ensure_dir(DEBUG_VISION_DIR)
+    img = scene_bgr.copy()
+
+    if npc is not None:
+        x1, y1 = npc["top_left"]
+        x2, y2 = x1 + npc["w"], y1 + npc["h"]
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            img,
+            f"NPC {npc['score']:.2f}",
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+        )
+
+    if player is not None:
+        x1, y1 = player["top_left"]
+        x2, y2 = x1 + player["w"], y1 + player["h"]
+        label = os.path.basename(player.get("template_path", "player"))
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(
+            img,
+            f"{label} {player['score']:.2f}",
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            1,
+        )
+
+    path = os.path.join(DEBUG_VISION_DIR, f"{timestamp_str()}_{prefix}.png")
+    cv2.imwrite(path, img)
+
+
+def locate_player_for_calibration(scene_bgr: np.ndarray, npc, threshold: float):
+    if npc is None:
+        return None
+
+    roi_left = npc["x"] + CALIB_PLAYER_MIN_DX - CALIB_PLAYER_ROI_MARGIN_X
+    roi_top = npc["y"] + CALIB_PLAYER_MIN_DY - CALIB_PLAYER_ROI_MARGIN_Y
+    roi_right = npc["x"] + CALIB_PLAYER_MAX_DX + CALIB_PLAYER_ROI_MARGIN_X
+    roi_bottom = npc["y"] + CALIB_PLAYER_MAX_DY + CALIB_PLAYER_ROI_MARGIN_Y
+
+    print(
+        f"[CALIB] ROI joueur calibration: "
+        f"({roi_left},{roi_top})-({roi_right},{roi_bottom})"
+    )
+
+    return locate_best_player_template_in_roi(
+        scene_bgr,
+        PLAYER_TEMPLATE_PATHS,
+        roi_left,
+        roi_top,
+        roi_right,
+        roi_bottom,
+        threshold=threshold
+    )
+
+
+def calibrate_reference_positions():
+    global REFERENCE_CALIBRATION
+
+    print("\n=== CALIBRATION VISUELLE ===")
+    print("Place ton personnage à la position de départ idéale devant le PNJ.")
+    input("Quand c'est fait, appuie sur Entrée...")
+
+    print("[CALIB] Tentative calibration PNJ + joueur...")
+
+    client = grab_ryujinx_client_bgr()
+    scene = crop_scene_region(client)
+
+    npc = locate_template(scene, NPC_TEMPLATE_PATH, threshold=NPC_TEMPLATE_THRESHOLD)
+
+    if npc is None:
+        print("[CALIB] Tentative 2 : PNJ avec seuil plus tolérant...")
+        npc = locate_template(scene, NPC_TEMPLATE_PATH, threshold=RECALIB_NPC_THRESHOLD)
+
+    if npc is None:
+        print("[ERREUR] PNJ non détecté pendant la calibration.")
+        print("=> Vérifie npc.png ou baisse encore le threshold.")
+        return False
+
+    player = locate_player_for_calibration(
+        scene,
+        npc,
+        threshold=PLAYER_TEMPLATE_THRESHOLD
+    )
+
+    save_debug_scene(scene, npc, player, prefix="calibration")
+
+    if player is None:
+        print("[WARN] Joueur non détecté dans la ROI de calibration.")
+        print("Calibration PNJ seule conservée.")
+
+        REFERENCE_CALIBRATION = {
+            "npc_x": npc["x"],
+            "npc_y": npc["y"],
+            "player_x": None,
+            "player_y": None,
+            "offset_x": None,
+            "offset_y": None,
+            "player_detected": False,
+        }
+
+        print(f"[CALIB] PNJ=({npc['x']},{npc['y']}) | mode=PNJ-seul\n")
+        return True
+
+    dx = player["x"] - npc["x"]
+    dy = player["y"] - npc["y"]
+
+    print(f"[CALIB] Vérification joueur dx={dx} dy={dy} score={player['score']:.3f}")
+
+    if dx < CALIB_PLAYER_MIN_DX or dx > CALIB_PLAYER_MAX_DX or dy < CALIB_PLAYER_MIN_DY or dy > CALIB_PLAYER_MAX_DY:
+        print(f"[WARN] Joueur détecté mais NON PLAUSIBLE pour calibration dx={dx} dy={dy}")
+        print("Calibration PNJ seule conservée.")
+
+        REFERENCE_CALIBRATION = {
+            "npc_x": npc["x"],
+            "npc_y": npc["y"],
+            "player_x": None,
+            "player_y": None,
+            "offset_x": None,
+            "offset_y": None,
+            "player_detected": False,
+        }
+
+        print(f"[CALIB] PNJ=({npc['x']},{npc['y']}) | mode=PNJ-seul\n")
+        return True
+
+    REFERENCE_CALIBRATION = {
+        "npc_x": npc["x"],
+        "npc_y": npc["y"],
+        "player_x": player["x"],
+        "player_y": player["y"],
+        "offset_x": dx,
+        "offset_y": dy,
+        "player_detected": True,
+    }
+
+    print(
+        f"[CALIB] SUCCESS | "
+        f"PNJ=({npc['x']},{npc['y']}) | "
+        f"JOUEUR=({player['x']},{player['y']}) | "
+        f"offset_x={dx} offset_y={dy}\n"
+    )
+
+    return True
+
+
+# =========================================================
+# RECALIBRAGE UNIQUE
+# =========================================================
+def fallback_dialog_search_reset(controller: Controller):
+    print("[RECALIB] Reset unique: 5 gauche, 4 bas, 5 droite, 2 haut, pad gauche")
+
+    move_left(controller, 5)
+    time.sleep(0.25)
+
+    move_down(controller, 4)
+    time.sleep(0.25)
+
+    move_right(controller, 9)
+    time.sleep(0.25)
+
+    move_up(controller, 2)
+    time.sleep(0.25)
+
+    dpad_left(controller, hold=0.12, wait=0.12)
+    time.sleep(0.15)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    controller = Controller()
+    failed_dialog_cycles = 0
+
+    print("\n=== CONFIGURATION MANETTE ===")
+    print(f"Tu as {CONTROLLER_SETUP_DELAY} secondes pour sélectionner")
+    print("la manette Xbox virtuelle dans Ryujinx.")
+    print("Laisse Ryujinx visible sur l'écran secondaire.\n")
+    time.sleep(CONTROLLER_SETUP_DELAY)
+
+    print(f"Démarrage dans {START_DELAY} secondes...\n")
+    time.sleep(START_DELAY)
+
+    ok = calibrate_reference_positions()
+    if not ok:
+        print("Calibration impossible. Arrêt du programme.")
+        return
+
+    print("Bot lancé. Ctrl+C pour arrêter.\n")
+
+    while True:
+        move_right(controller, INITIAL_RIGHT_TAPS)
+        do_egg_steps(controller)
+
+        result = interact_with_npc_and_resolve(controller)
+
+        if result in ("egg", "no_egg"):
+            failed_dialog_cycles = 0
+        else:
+            failed_dialog_cycles += 1
+            print(f"[WARN] Echec de dialogue ({failed_dialog_cycles}/{VISION_RECALIB_FAIL_THRESHOLD})")
+
+        if failed_dialog_cycles >= VISION_RECALIB_FAIL_THRESHOLD:
+            fallback_dialog_search_reset(controller)
+            failed_dialog_cycles = 0
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nArrêt demandé.")
